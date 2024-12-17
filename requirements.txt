@@ -1,0 +1,4 @@
+Flask==3.0.3
+chromadb==0.4.24
+ollama
+langchain
