@@ -16,14 +16,20 @@ import pymupdf
 import numpy as np
 import pytesseract
 from PIL import Image
+import requests
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 np.float_ = np.float64
+import warnings
+warnings.filterwarnings("ignore", message="ARC4 has been moved to cryptography.hazmat.decrepit")
+
 # create the Flask app
 app = Flask(__name__)
 
 folder_path = "db"
 image_folder = "pdf_images"
 cached_llm = OllamaLLM(model="llama3:8b")
+OLLAMA_HOST = "http://localhost:11434"
+VISION_MODEL = "llava"
 embedding = FastEmbedEmbeddings()
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1024, chunk_overlap=80, length_function=len, is_separator_regex=False
@@ -42,6 +48,7 @@ raw_prompt = PromptTemplate.from_template(
     Answer:
     """
 )
+
 
 def extract_images_from_pdf(pdf_path, pdf_filename):
     """Extract images + OCR text from PDF"""
@@ -66,7 +73,8 @@ def extract_images_from_pdf(pdf_path, pdf_filename):
                 f.write(image_bytes)
 
             # Extract text from image using OCR
-            extracted_text = extract_text_from_image(image_bytes)
+            # extracted_text = extract_text_from_image(image_bytes)
+            extracted_text = analyze_image_with_llava(image_bytes)
 
             image_data.append({
                 "page": page_num + 1,
@@ -77,6 +85,8 @@ def extract_images_from_pdf(pdf_path, pdf_filename):
                 "text": extracted_text,  # Extracted OCR text
                 "base64": base64.b64encode(image_bytes).decode('utf-8')
             })
+
+            print('images '+str(img_index + 1)+'have been extracted')
 
     return image_data
 
@@ -92,6 +102,90 @@ def extract_text_from_image(image_bytes):
     except Exception as e:
         print(f"OCR Error: {e}")
         return ""
+
+
+def analyze_image_with_llava(image_bytes):
+    """Send image to Ollama LLaVA for analysis"""
+    try:
+        # Convert image to base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+
+        # Prepare prompt for classification
+        prompt = """
+            Analyze the provided image and generate a comprehensive JSON response. Your response MUST adhere to the following structure and content guidelines:
+
+            {
+            "type": "...",
+            "description": "...",
+            "data": {} // ONLY present and populated if 'type' is "table" or "graph" or content have tabular data arrangement
+            }
+
+            Guidance for 'type' field:
+            - Set "type" to "table" if the image content INCLUDE some form of tabular data arrangement even the primaryly content is textual
+            - Set "type" to "text" if the primary content of The image features textual information without any tabular data.
+            - Set "type" to "graph" if the image displays a chart, plot, diagram, or any form of data visualization.
+            - Set "type" to "others" if the content does not fit the above categories.
+
+            Guidance for 'description' field:
+            - if type is "text", set the descriptions field with the unmodified, all extracted text. Avoid any form of interpretation. Do not describe the visual icon or any image JUST the TEXT
+            - if type is NOT "text" set the description to informative textual summary of the image's content. For "image-only", describe the visual elements. For "table" or "graph", describe the overall purpose or topic of the table/graph.
+
+            Guidance for 'data' field (crucial for "table" and "graph"):
+            - If "type" is "table", meticulously extract all data from the table and represent it as a JSON array of objects, where each object represents a row and keys are column headers.
+            - If "type" is "graph", interpret the visual data (e.g., bar heights, line trends, pie slices) and represent it as a structured JSON object. Focus on key labels, values, and trends.
+            - If "type" is NOT "table" or "graph", the "data" field MUST be an empty JSON object `{}`.
+
+            **Example 1 (Image with text):**
+            Input Image: An article snippet with paragraphs of text.
+            Expected Output:
+            ```json
+            {
+            "type": "text",
+            "description": "Events will be held at Jakarta, Indonesia 19-20 May 2025 at 11:00 - 15:00",
+            "data": {}
+            }
+
+            Example 2 (Image with a table):
+            Input Image: A table showing sales figures for different products across quarters.
+            Expected Output:
+
+            {
+            "type": "table",
+            "description": "Quarterly sales performance data for various product categories.",
+            "data": [
+                {"Product": "Laptop", "Q1": 1200, "Q2": 1500, "Q3": 1350},
+                {"Product": "Monitor", "Q1": 800, "Q2": 950, "Q3": 880},
+                {"Product": "Keyboard", "Q1": 500, "Q2": 620, "Q3": 550}
+            ]
+            }
+        """
+
+        # Call Ollama API
+        response = requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={
+                "model": VISION_MODEL,
+                "prompt": prompt,
+                "images": [base64_image],
+                "format": "json",
+                "stream": False
+            }
+        )
+
+        # Parse response
+        result = json.loads(response.json()["response"])
+        if result['type'].lower() == 'text':
+            result['description'] = extract_text_from_image(image_bytes)
+            
+        content = f"IMAGE ANALYSIS:\nType: {result['type']}\nDescription: {result['description']}"
+        
+
+        print(content)
+        return content
+
+    except Exception as e:
+        print(f"Ollama vision error: {e}")
+        return {"type": "error", "description": "Analysis failed"}
 
 
 @app.route("/askPorter", methods=["POST"])
@@ -255,7 +349,8 @@ def pdfImagePost():
         "doc_len": len(docs),
         "chunks": len(chunks),
         "images_extracted": len(images),
-        "images": images[:5],  # Return first 5 images metadata (avoid huge response)
+        # Return first 5 images metadata (avoid huge response)
+        "images": images[:3],
         "message": "Full image data available in response if needed"
     }
     return jsonify(response)
